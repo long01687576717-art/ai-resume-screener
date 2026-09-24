@@ -19,6 +19,7 @@ import re
 import time
 import statistics
 from typing import Optional, List, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pydantic import BaseModel, Field, ValidationError
 import requests
 
@@ -57,6 +58,8 @@ class ProjectItem(BaseModel):
 class BasicInfo(BaseModel):
     name: Optional[str] = None
     years_of_experience: Optional[float] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
 
 
 class ResumeProfile(BaseModel):
@@ -184,7 +187,7 @@ def build_extract_prompt(resume_text: str) -> str:
 
 请严格输出以下 JSON 结构：
 {{
-  "basic_info": {{"name": "", "years_of_experience": "估算总工作年限，数字或null"}},
+  "basic_info": {{"name": "", "years_of_experience": "估算总工作年限，数字或null", "email": "候选人的邮箱地址，没有则填 null", "phone": "候选人的手机号，没有则填 null"}},
   "education": [{{"school": "", "degree": "", "major": "", "duration": ""}}],
   "work_experience": [{{"company": "", "title": "", "duration": "", "highlights": ["关键职责或成果，简短"]}}],
   "projects": [{{"name": "", "role": "", "description": "一两句话概括"}}],
@@ -286,7 +289,7 @@ def build_combined_prompt(jd_text: str, resume_text: str, extra_context: str = "
 请严格输出以下 JSON 结构，不要包含 JSON 之外的任何文字：
 {{
   "profile": {{
-    "basic_info": {{"name": "", "years_of_experience": "数字或null"}},
+    "basic_info": {{"name": "", "years_of_experience": "数字或null", "email": "候选人的邮箱地址，没有则填 null", "phone": "候选人的手机号，没有则填 null"}},
     "education": [{{"school": "", "degree": "", "major": "", "duration": ""}}],
     "work_experience": [{{"company": "", "title": "", "duration": "", "highlights": ["简短描述"]}}],
     "projects": [{{"name": "", "role": "", "description": "一两句话概括"}}],
@@ -434,3 +437,112 @@ def run_pipeline(jd_text: str, resume_text: str, api_key: str, model: str,
     merged = _finalize_merged(eval_parts, n_runs, aux=profiles)
     merged["extracted_profile"] = merged.pop("_aux")
     return merged
+
+
+# ===========================================================
+# 九、对话式 JD 提取：把 HR 口语化需求改写为结构化 JD 文本
+# ===========================================================
+JD_EXTRACT_SYSTEM = (
+    "你是一名资深招聘顾问，擅长把 HR 口语化的招聘需求改写为规范、完整、可直接用于筛选简历的职位描述（JD）。"
+    "请输出一份结构化 JD 正文，依次包含以下小节："
+    "【岗位名称】【核心职责】【硬性要求】【加分项】。"
+    "信息不足时基于常见行业常识合理补全，但不要编造过于具体的数字（精确薪资、精确年限可写成合理范围）。"
+    "直接输出 JD 正文，不要任何解释、前言或代码块标记。"
+)
+
+
+def extract_jd(requirement: str, api_key: str, model: str) -> str:
+    """把一句话/一段口语化需求改写为结构化 JD 文本（自由文本，非 JSON）。"""
+    messages = [
+        {"role": "system", "content": JD_EXTRACT_SYSTEM},
+        {"role": "user", "content": f"招聘需求（口语化）：\n{requirement}\n\n请输出结构化 JD 正文。"},
+    ]
+    return call_chat(messages, api_key, model)
+
+
+# ===========================================================
+# 十、AI 邮件生成：为每位候选人定制个性化邮件（禁止群发同一封）
+# ===========================================================
+class EmailDraft(BaseModel):
+    候选人: str = ""
+    subject: str = ""
+    body: str = ""
+
+
+EMAIL_GEN_SYSTEM = (
+    "你是一名专业的招聘邮件撰写助手，熟悉 HR 与候选人沟通的语气与礼仪。"
+    "请根据候选人的简历亮点和评分，为「这一位」候选人定制一封个性化邮件，严禁把同一封邮件模板群发多人。"
+    "邮件正文使用简洁的 HTML 排版（如 <p>、<br>、<b> 等标签），但不要包含 <html>/<head>/<body> 外层标签。"
+)
+
+EMAIL_TYPE_GUIDE = {
+    "面试邀约": "突出你对他某段经历/技能的认可，语气热情、正式，邀请他进入下一轮面试。",
+    "Offer通知": "正式、祝贺的语气，概述岗位与入职事项，欢迎他加入团队。",
+    "拒信": "委婉、尊重、维护雇主品牌，感谢其投入，说明本轮暂不匹配但会保留简历/欢迎关注后续机会。",
+    "自定义": "按补充说明里的要求撰写。",
+}
+
+
+def generate_email(candidate_info: dict, email_type: str, extra_info: str, api_key: str, model: str) -> dict:
+    """为单个候选人生成定制化邮件，返回 {"候选人": str, "subject": str, "body": str(HTML)}。"""
+    guide = EMAIL_TYPE_GUIDE.get(email_type, EMAIL_TYPE_GUIDE["自定义"])
+    candidate_block = json.dumps(candidate_info, ensure_ascii=False, indent=2)
+    extra_block = f"\n【补充说明（HR 提供）】\n{extra_info}\n" if (extra_info or "").strip() else ""
+    user_prompt = f"""请为下面这位候选人撰写一封「{email_type}」邮件。
+
+【候选人信息】
+{candidate_block}
+{extra_block}
+【撰写要求】
+{guide}
+- 结合候选人的真实亮点个性化撰写，不要泛泛而谈，不要群发式模板腔。
+- 邮件正文用简洁 HTML 排版（<p>、<br>、<b> 等），不要输出 <html>/<head>/<body> 外层标签。
+- 主题控制在 30 字以内。
+
+请严格输出如下 JSON，不要包含 JSON 之外的任何文字：
+{{
+  "候选人": "{candidate_info.get('候选人', '')}",
+  "subject": "邮件主题",
+  "body": "邮件正文(HTML)"
+}}
+"""
+    messages = [
+        {"role": "system", "content": EMAIL_GEN_SYSTEM},
+        {"role": "user", "content": user_prompt},
+    ]
+    draft = _call_structured(messages, api_key, model, EmailDraft, temperature=0.7)
+    name = draft.候选人 or candidate_info.get("候选人", "")
+    return {"候选人": name, "subject": draft.subject, "body": draft.body}
+
+
+def generate_emails_batch(candidates: List[dict], extra_info: str, api_key: str, model: str,
+                          max_workers: int = 3) -> dict:
+    """并发为多位候选人生成定制邮件（默认并发数 3，防止触发限流）。
+
+    candidates：每个元素为 dict，需含 `candidate_name` 字段，可预先带 `email_type` 字段指定邮件类型。
+    返回 {候选人姓名: {"候选人","subject","body","email_type"}}。
+    """
+    def _one(c):
+        name = c.get("candidate_name", "")
+        etype = c.get("email_type") or "自定义"
+        info = {
+            "候选人": name,
+            "score": c.get("score"),
+            "strengths": c.get("strengths", []),
+            "risks": c.get("risks", []),
+            "extracted_profile": c.get("extracted_profile", {}),
+        }
+        try:
+            draft = generate_email(info, etype, extra_info, api_key, model)
+        except Exception as e:
+            draft = {"候选人": name, "subject": "（生成失败）", "body": f"<p>生成失败：{e}</p>"}
+        draft["email_type"] = etype
+        return name, draft
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_one, c) for c in candidates]
+        for fut in as_completed(futures):
+            name, draft = fut.result()
+            results[name] = draft
+    return results

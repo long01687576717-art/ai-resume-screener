@@ -48,6 +48,7 @@ def init_db():
                 extracted_profile TEXT,
                 candidate_graduation_year INTEGER,
                 graduation_match INTEGER,
+                email TEXT,
                 status TEXT NOT NULL,
                 error TEXT
             )
@@ -58,6 +59,8 @@ def init_db():
             conn.execute("ALTER TABLE evaluations ADD COLUMN candidate_graduation_year INTEGER")
         if "graduation_match" not in existing_cols:
             conn.execute("ALTER TABLE evaluations ADD COLUMN graduation_match INTEGER")
+        if "email" not in existing_cols:
+            conn.execute("ALTER TABLE evaluations ADD COLUMN email TEXT")
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_cache_lookup
             ON evaluations (jd_hash, resume_hash, model, prompt_version)
@@ -72,6 +75,19 @@ def init_db():
                 corrected_score INTEGER,
                 comment TEXT,
                 FOREIGN KEY (evaluation_id) REFERENCES evaluations(id)
+            )
+        """)
+        # 邮件发送记录表：记录每次通过邮件中心发出的邮件，便于追溯发送状态
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS email_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at REAL NOT NULL,
+                candidate_name TEXT NOT NULL,
+                recipient_email TEXT,
+                email_type TEXT,
+                subject TEXT,
+                body TEXT,
+                status TEXT NOT NULL
             )
         """)
 
@@ -96,15 +112,15 @@ def save_result(*, jd_hash, jd_text, candidate_name, resume_hash, resume_text,
                  model, prompt_version, status, score=None, dimension_scores=None,
                  strengths=None, risks=None, interview_questions=None,
                  extracted_profile=None, candidate_graduation_year=None,
-                 graduation_match=None, error=None) -> int:
+                 graduation_match=None, email=None, error=None) -> int:
     with get_conn() as conn:
         cur = conn.execute("""
             INSERT INTO evaluations (
                 created_at, jd_hash, jd_text, candidate_name, resume_hash, resume_text,
                 model, prompt_version, score, dimension_scores, strengths, risks,
                 interview_questions, extracted_profile, candidate_graduation_year,
-                graduation_match, status, error
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                graduation_match, email, status, error
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             time.time(), jd_hash, jd_text, candidate_name, resume_hash, resume_text,
             model, prompt_version, score,
@@ -115,7 +131,7 @@ def save_result(*, jd_hash, jd_text, candidate_name, resume_hash, resume_text,
             json.dumps(extracted_profile, ensure_ascii=False) if extracted_profile else None,
             candidate_graduation_year,
             None if graduation_match is None else int(bool(graduation_match)),
-            status, error,
+            email, status, error,
         ))
         return cur.lastrowid
 
@@ -125,6 +141,7 @@ def row_to_result(row: dict) -> dict:
     return {
         "候选人": row["candidate_name"],
         "score": row["score"],
+        "email": row.get("email"),
         "dimension_scores": json.loads(row["dimension_scores"]) if row["dimension_scores"] else {},
         "strengths": json.loads(row["strengths"]) if row["strengths"] else [],
         "risks": json.loads(row["risks"]) if row["risks"] else [],
@@ -164,3 +181,45 @@ def feedback_stats():
         total = conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"]
         agree = conn.execute("SELECT COUNT(*) c FROM feedback WHERE verdict='agree'").fetchone()["c"]
         return {"total": total, "agree": agree, "disagree": total - agree}
+
+
+def list_candidates(limit: int = 200):
+    """供邮件中心使用：返回最近评估成功、且按姓名去重（取最新一次）的候选人完整信息。
+
+    strengths / risks / extracted_profile 已解析为 Python 对象。
+    """
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT id, candidate_name, score, email, resume_text, strengths, risks, extracted_profile
+            FROM evaluations WHERE status='ok' ORDER BY created_at DESC
+        """).fetchall()
+    seen = {}
+    for r in rows:
+        d = dict(r)
+        name = d["candidate_name"]
+        if name not in seen:
+            d["strengths"] = json.loads(d["strengths"]) if d["strengths"] else []
+            d["risks"] = json.loads(d["risks"]) if d["risks"] else []
+            d["extracted_profile"] = json.loads(d["extracted_profile"]) if d["extracted_profile"] else {}
+            seen[name] = d
+    return list(seen.values())[:limit]
+
+
+def save_email_log(*, candidate_name, recipient_email=None, email_type=None,
+                   subject=None, body=None, status="sent"):
+    """记录一封邮件的发送结果（成功/失败均记录，便于追溯）。"""
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO email_log (created_at, candidate_name, recipient_email, email_type, subject, body, status)
+            VALUES (?,?,?,?,?,?,?)
+        """, (time.time(), candidate_name, recipient_email, email_type, subject, body, status))
+
+
+def list_email_log(limit: int = 50):
+    """查询最近的邮件发送记录，用于「邮件中心」展示。"""
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT created_at, candidate_name, recipient_email, email_type, status
+            FROM email_log ORDER BY created_at DESC LIMIT ?
+        """, (limit,)).fetchall()
+        return [dict(r) for r in rows]

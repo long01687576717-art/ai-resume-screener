@@ -1,3 +1,6 @@
+import re
+import json
+import smtplib
 import streamlit as st
 import pdfplumber
 import docx
@@ -5,6 +8,10 @@ import pandas as pd
 import hashlib
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
+from email.header import Header
 
 import db
 import engine
@@ -16,10 +23,10 @@ st.set_page_config(page_title="AI 简历筛选助手", page_icon="📄", layout=
 db.init_db()
 
 st.title("📄 AI 简历筛选助手")
-st.caption("上传 JD 与简历（可多份），自动打分、给出优势/风险与面试题 · 结果自动保存，支持追问对话")
+st.caption("对话式筛选 + 一键邮件沟通 · 结果自动保存缓存，支持追问")
 
 # ---------------------------------------------------------
-# 侧边栏：API 配置
+# 侧边栏：配置 + 文件上传区
 # ---------------------------------------------------------
 with st.sidebar:
     st.header("⚙️ 配置")
@@ -42,6 +49,20 @@ with st.sidebar:
 
     force_refresh = st.checkbox("忽略缓存，强制重新评估", value=False,
                                 help="默认命中相同 JD+简历+模型+配置 的历史评估会直接复用，不再重复调用 API")
+
+    st.divider()
+    st.header("📎 文件上传区")
+    jd_file = st.file_uploader("上传 JD (PDF / Word)", type=["pdf", "docx"], key="jd",
+                               help="在对话框里没打字时，会使用这里上传的 JD 进行评估")
+    resume_files = st.file_uploader("上传简历（可多选，最多 20 份）", type=["pdf", "docx"],
+                                    accept_multiple_files=True, key="resumes")
+    st.caption("💡 为保证评估质量与系统稳定，单次上传建议不超过 20 份简历。")
+    if len(resume_files) > 20:
+        st.error("单次最多支持评估 20 份，请分批上传")
+    file_run_btn = st.button("🚀 使用上传的 JD 开始评估", type="primary",
+                             disabled=not (jd_file and resume_files),
+                             help="适用于：不在对话框打字，直接用上传的 JD + 简历批量评估")
+
     st.divider()
     st.markdown(
         "**评分说明**：满分 100 分，技能匹配 40% + 经验匹配 30% + 教育背景 15% + 稳定性 15%（综合判断，非机械加权）。")
@@ -112,6 +133,8 @@ def process_one(candidate_name: str, jd_text: str, resume_text: str, api_key: st
     try:
         result = engine.run_pipeline(jd_text, resume_text, api_key, model, extra_context,
                                      consistency_mode, fast_mode)
+        profile = result.get("extracted_profile") or {}
+        email = (profile.get("basic_info") or {}).get("email")
         eval_id = db.save_result(
             jd_hash=jd_hash, jd_text=jd_text, candidate_name=candidate_name,
             resume_hash=resume_hash, resume_text=resume_text,
@@ -119,7 +142,7 @@ def process_one(candidate_name: str, jd_text: str, resume_text: str, api_key: st
             score=result.get("score"), dimension_scores=result.get("dimension_scores"),
             strengths=result.get("strengths"), risks=result.get("risks"),
             interview_questions=result.get("interview_questions"),
-            extracted_profile=result.get("extracted_profile"),
+            extracted_profile=profile, email=email,
         )
         result["候选人"] = candidate_name
         result["_resume_text"] = resume_text
@@ -135,77 +158,213 @@ def process_one(candidate_name: str, jd_text: str, resume_text: str, api_key: st
 
 
 # ---------------------------------------------------------
-# 主体：文件上传
+# 批量评估（流式进度，并发数固定为 3 以防限流）
 # ---------------------------------------------------------
-tab_screen, tab_history = st.tabs(["🚀 筛选简历", "🕓 历史记录"])
-
-with tab_screen:
-    col1, col2 = st.columns(2)
-    with col1:
-        jd_file = st.file_uploader("上传 JD (PDF / Word)", type=["pdf", "docx"], key="jd")
-    with col2:
-        resume_files = st.file_uploader("上传简历 (可多选，PDF / Word)", type=["pdf", "docx"],
-                                        accept_multiple_files=True, key="resumes")
-        st.caption("💡 为保证评估质量与系统稳定，单次上传建议不超过 20 份简历。")
-
-    if "results" not in st.session_state:
+def run_evaluation(jd_text: str, resume_files, api_key: str, model: str,
+                   skip_cache: bool, extra_context: str, consistency_mode: bool, fast_mode: bool):
+    """批量评估多份简历。进度条会渲染到当前容器（对话气泡或主界面）。"""
+    if len(resume_files) > 20:
+        st.error("单次最多支持评估 20 份，请分批上传")
         st.session_state.results = []
-    if "chat_histories" not in st.session_state:
-        st.session_state.chat_histories = {}
+        return
 
-    run_btn = st.button("🚀 开始评估", type="primary", disabled=not (jd_file and resume_files))
+    resume_texts = {}
+    extract_errors = {}
+    for f in resume_files:
+        try:
+            resume_texts[f.name] = extract_text_from_file(f)
+        except Exception as e:
+            extract_errors[f.name] = str(e)
 
-    if run_btn:
-        if len(resume_files) > 20:
-            st.error("单次最多支持评估 20 份，请分批上传")
-        elif not api_key:
+    if extract_errors:
+        for name, err in extract_errors.items():
+            st.error(f"「{name}」提取失败：{err}")
+
+    results_by_name = {}
+    for name, err in extract_errors.items():
+        results_by_name[name] = {"候选人": name, "score": None, "error": f"文件提取失败：{err}"}
+
+    if resume_texts:
+        progress = st.progress(0, text="准备评估...")
+        st.caption("评估过程会消耗 DeepSeek API 额度，请耐心等待 1-2 分钟。")
+        done_count = 0
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = {
+                pool.submit(process_one, name, jd_text, text, api_key, model,
+                            skip_cache, extra_context, consistency_mode, fast_mode): name
+                for name, text in resume_texts.items()
+            }
+            for future in as_completed(futures):
+                name = futures[future]
+                results_by_name[name] = future.result()
+                done_count += 1
+                progress.progress(done_count / len(resume_texts),
+                                  text=f"正在评估：{name.rsplit('.', 1)[0]}（第 {done_count}/{len(resume_texts)} 份）...")
+        progress.empty()
+
+    st.session_state.results = [results_by_name[f.name] for f in resume_files]
+
+
+# ---------------------------------------------------------
+# 邮件中心工具函数（基于 smtplib，不引入额外第三方库）
+# ---------------------------------------------------------
+def extract_email(text: str) -> str:
+    """从简历原文里粗提取第一个邮箱地址。"""
+    m = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", text or "")
+    return m.group(0) if m else ""
+
+
+def _candidate_email(c) -> str:
+    """优先取结构化抽取的邮箱（db.email），回退到从简历原文正则提取。"""
+    return c.get("email") or extract_email(c.get("resume_text", ""))
+
+
+def _suggest_email_type(score) -> str:
+    if score is None:
+        return "自定义"
+    if score >= 80:
+        return "Offer通知"
+    if score >= 60:
+        return "面试邀约"
+    return "拒信"
+
+
+def _connect_smtp(server: str, sender: str, auth_code: str):
+    """优先 SSL:465，失败再试 STARTTLS:587。"""
+    errors = []
+    try:
+        s = smtplib.SMTP_SSL(server, 465, timeout=20)
+        s.login(sender, auth_code)
+        return s
+    except Exception as e:
+        errors.append(f"SSL:465 → {e}")
+    try:
+        s = smtplib.SMTP(server, 587, timeout=20)
+        s.starttls()
+        s.login(sender, auth_code)
+        return s
+    except Exception as e:
+        errors.append(f"STARTTLS:587 → {e}")
+    raise RuntimeError("；".join(errors))
+
+
+def _send_one_email(sender_email: str, auth_code: str, smtp_server: str,
+                    to_email: str, subject: str, html_body: str, attachments=None):
+    msg = MIMEMultipart()
+    msg["From"] = sender_email
+    msg["To"] = to_email
+    msg["Subject"] = Header(subject or "", "utf-8")
+    msg.attach(MIMEText(html_body or "", "html", "utf-8"))
+    for f in (attachments or []):
+        part = MIMEApplication(f.getvalue())
+        part.add_header("Content-Disposition", "attachment", filename=("utf-8", "", f.name))
+        msg.attach(part)
+    s = _connect_smtp(smtp_server, sender_email, auth_code)
+    try:
+        s.sendmail(sender_email, [to_email], msg.as_string())
+    finally:
+        s.quit()
+
+
+# ---------------------------------------------------------
+# 会话状态初始化
+# ---------------------------------------------------------
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "results" not in st.session_state:
+    st.session_state.results = []
+if "chat_histories" not in st.session_state:
+    st.session_state.chat_histories = {}
+if "jd_text" not in st.session_state:
+    st.session_state.jd_text = ""
+if "email_drafts" not in st.session_state:
+    st.session_state.email_drafts = {}
+if "send_failures" not in st.session_state:
+    st.session_state.send_failures = []
+
+# ---------------------------------------------------------
+# 三个页签：筛选简历 / 历史记录 / 邮件中心
+# ---------------------------------------------------------
+tab_screen, tab_history, tab_email = st.tabs(["筛选简历", "历史记录", "📧 邮件中心"])
+
+# ===========================================================
+# 页签一：筛选简历（对话式）
+# ===========================================================
+with tab_screen:
+    # 触发路径一：未在对话框打字，直接用上传的 JD + 简历评估
+    if file_run_btn:
+        if not api_key:
             st.error("请先在左侧栏填写 DeepSeek API Key")
+        elif len(resume_files) > 20:
+            st.error("单次最多支持评估 20 份，请分批上传")
         else:
             jd_text = extract_text_from_file(jd_file)
             st.session_state.jd_text = jd_text
-            st.session_state.chat_histories = {}
+            st.markdown("**📄 已读取上传的 JD，开始评估...**")
+            run_evaluation(jd_text, resume_files, api_key, model_name, force_refresh,
+                           extra_context, consistency_mode, fast_mode)
 
-            resume_texts = {}
-            extract_errors = {}
-            for f in resume_files:
-                try:
-                    resume_texts[f.name] = extract_text_from_file(f)
-                except Exception as e:
-                    extract_errors[f.name] = str(e)
+    # 触发路径二：对话流（核心）
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
 
-            if extract_errors:
-                for name, err in extract_errors.items():
-                    st.error(f"「{name}」提取失败：{err}")
+    prompt = st.chat_input("描述你要招的岗位，例如：帮我招个 Python 后端，3 年经验，要懂 AI ...")
 
-            results_by_name = {}
-            for name, err in extract_errors.items():
-                results_by_name[name] = {"候选人": name, "score": None, "error": f"文件提取失败：{err}"}
+    if prompt:
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
 
-            if resume_texts:
-                progress = st.progress(0, text="准备评估...")
-                st.caption("评估过程会消耗 DeepSeek API 额度，请耐心等待 1-2 分钟。")
-                done_count = 0
+        if not api_key:
+            err = "⚠️ 请先在左侧栏填写 DeepSeek API Key。"
+            st.session_state.messages.append({"role": "assistant", "content": err})
+            with st.chat_message("assistant"):
+                st.markdown(err)
+        else:
+            with st.chat_message("assistant"):
+                with st.spinner("🔍 正在把需求整理成结构化 JD ..."):
+                    try:
+                        jd_text = engine.extract_jd(prompt, api_key, model_name)
+                    except Exception as e:
+                        jd_text = None
+                        st.error(f"⚠️ JD 提取失败：{e}")
 
-                with ThreadPoolExecutor(max_workers=3) as pool:
-                    futures = {
-                        pool.submit(process_one, name, jd_text, text, api_key, model_name,
-                                    force_refresh, extra_context, consistency_mode, fast_mode): name
-                        for name, text in resume_texts.items()
-                    }
-                    for future in as_completed(futures):
-                        name = futures[future]
-                        results_by_name[name] = future.result()
-                        done_count += 1
-                        progress.progress(done_count / len(resume_texts),
-                                          text=f"正在评估：{name.rsplit('.', 1)[0]}（第 {done_count}/{len(resume_texts)} 份）...")
-                progress.empty()
+            if jd_text:
+                st.session_state.jd_text = jd_text
+                hint = "🔍 已自动提取岗位要求：\n\n" + jd_text
+                st.session_state.messages.append({"role": "assistant", "content": hint})
+                with st.chat_message("assistant"):
+                    st.caption("🔍 已自动提取岗位要求：")
+                    st.markdown(jd_text)
 
-            st.session_state.results = [results_by_name[f.name] for f in resume_files]
-            st.success("评估完成！（命中缓存的简历未重新调用 API）")
+                if resume_files:
+                    if len(resume_files) > 20:
+                        err20 = "⚠️ 单次最多支持评估 20 份，请分批上传。"
+                        st.session_state.messages.append({"role": "assistant", "content": err20})
+                        with st.chat_message("assistant"):
+                            st.error("单次最多支持评估 20 份，请分批上传")
+                    else:
+                        with st.chat_message("assistant"):
+                            st.markdown(f"📋 检测到已上传 {len(resume_files)} 份简历，开始评估...")
+                            run_evaluation(jd_text, resume_files, api_key, model_name, force_refresh,
+                                           extra_context, consistency_mode, fast_mode)
+                        n = len(resume_files)
+                        ok = sum(1 for r in st.session_state.results if not r.get("error"))
+                        done_msg = f"✅ 评估完成！共 {n} 份简历（{ok} 份成功）。结果见下方。"
+                        st.session_state.messages.append({"role": "assistant", "content": done_msg})
+                        with st.chat_message("assistant"):
+                            st.markdown(done_msg)
+                else:
+                    tip = "📎 尚未上传简历。请在左侧「文件上传区」上传简历（最多 20 份）后，我即可自动开始评估；也可以直接再说一次需求。"
+                    st.session_state.messages.append({"role": "assistant", "content": tip})
+                    with st.chat_message("assistant"):
+                        st.markdown(tip)
 
-    # -------------------------------------------------------
-    # 结果展示
-    # -------------------------------------------------------
+    # ---------------------------------------------------
+    # 结果展示（评估完成后）
+    # ---------------------------------------------------
     if st.session_state.results:
         st.divider()
         st.subheader("📊 评估结果总览")
@@ -233,7 +392,6 @@ with tab_screen:
 
         st.dataframe(df.style.map(_highlight_score, subset=["总分"]), use_container_width=True)
 
-        # 导出 CSV：额外带上「优势 / 风险 / 面试问题」，方便 HR 直接转发给业务部门
         export_rows = []
         for r in st.session_state.results:
             row = {"候选人": r["候选人"], "总分": r.get("score"), **r.get("dimension_scores", {})}
@@ -284,9 +442,6 @@ with tab_screen:
                 for q in r.get("interview_questions", []):
                     st.markdown(f"- {q}")
 
-                # ---------------------------------------------------
-                # HR 反馈：积累人工判断，作为未来评估集/一致性验证的基础
-                # ---------------------------------------------------
                 eval_id = r.get("_eval_id")
                 if eval_id:
                     st.divider()
@@ -337,11 +492,13 @@ with tab_screen:
                 with st.chat_message(msg["role"]):
                     st.markdown(msg["content"])
 
-            user_question = st.chat_input(f"就「{selected_name}」向 AI 提问...")
+            user_question = st.text_input(f"就「{selected_name}」向 AI 提问...", key="followup_q")
 
-            if user_question:
+            if st.button("发送", key="followup_send"):
                 if not api_key:
                     st.error("请先在左侧栏填写 DeepSeek API Key")
+                elif not user_question.strip():
+                    st.warning("请输入问题。")
                 else:
                     selected_result = next(r for r in st.session_state.results if r["候选人"] == selected_name)
                     jd_text_for_chat = st.session_state.get("jd_text", "")
@@ -385,9 +542,9 @@ with tab_screen:
 
                     st.session_state.chat_histories[selected_name].append({"role": "assistant", "content": answer})
 
-# ---------------------------------------------------------
-# 历史记录页签
-# ---------------------------------------------------------
+# ===========================================================
+# 页签二：历史记录
+# ===========================================================
 with tab_history:
     st.subheader("最近评估历史（来自本地数据库，跨会话保留）")
     rows = db.list_history(limit=100)
@@ -414,3 +571,174 @@ with tab_history:
         fc2.metric("认可", fb["agree"])
         fc3.metric("不认可", fb["disagree"])
         st.caption("这些反馈会持续积累，未来可用于验证 Prompt 改动是让评分更准了还是更差了。")
+
+# ===========================================================
+# 页签三：邮件中心
+# ===========================================================
+with tab_email:
+    st.subheader("📧 邮件沟通中心")
+
+    # ---- 发件人配置（仅存 session_state，不落盘） ----
+    st.markdown("**🔐 发件人配置**（敏感信息仅存于本次会话的 st.session_state，绝不写入数据库或本地文件）")
+    sc1, sc2, sc3 = st.columns(3)
+    with sc1:
+        sender_email = st.text_input("发件邮箱", key="sender_email", placeholder="you@qq.com")
+    with sc2:
+        auth_code = st.text_input("邮箱授权码", type="password", key="auth_code")
+    with sc3:
+        smtp_server = st.text_input("SMTP 服务器", key="smtp_server", value="smtp.qq.com")
+    st.caption("默认 smtp.qq.com；163 邮箱请改为 smtp.163.com。")
+
+    st.divider()
+
+    candidates = db.list_candidates(limit=300)
+    if not candidates:
+        st.info("暂无历史评估结果。请先在「筛选简历」页签完成评估，再回来选择收件人。")
+    else:
+        # ---- 收件人筛选（分数滑块 + 手动补充，合并去重） ----
+        st.markdown("**👥 收件人筛选**")
+        score_range = st.slider("按分数筛选", 0, 100, (0, 100))
+        manual_input = st.text_input(
+            "手动补充候选人（姓名或关键词，用逗号分隔）",
+            placeholder="例如：夏忠心, 马木提, 有AI经验",
+            key="manual_candidates",
+        )
+        keywords = [k.strip() for k in re.split(r"[,，]", manual_input) if k.strip()]
+
+        score_hits = [c for c in candidates
+                      if c.get("score") is not None and score_range[0] <= c["score"] <= score_range[1]]
+        manual_hits = [c for c in candidates if keywords and any(
+            k in (c["candidate_name"] or "") or k in (c.get("resume_text") or "") for k in keywords)]
+
+        score_names = {c["candidate_name"] for c in score_hits}
+        merged = []
+        for c in score_hits:
+            merged.append((c, ""))
+        for c in manual_hits:
+            if c["candidate_name"] not in score_names:
+                merged.append((c, "[手动补充]"))
+
+        if not merged:
+            st.info("当前筛选条件下没有匹配的候选人，请调整分数范围或补充关键词。")
+            selected = []
+        else:
+            view_df = pd.DataFrame([
+                {"候选人": c["candidate_name"], "分数": c.get("score"),
+                 "邮箱": _candidate_email(c) or "未识别到邮箱", "备注": mark}
+                for c, mark in merged
+            ])
+            st.caption(f"共 {len(merged)} 位候选人，请在下方勾选要发送的名单：")
+            if any(not _candidate_email(c) for c, _ in merged):
+                st.caption("⚠️ 部分候选人未识别到邮箱，生成邮件后请在「收件邮箱」处手动补充。")
+            sel_event = st.dataframe(view_df, selection_mode="multi-row", on_select="rerun",
+                                     key="email_select", use_container_width=True)
+            selected_rows = list(sel_event.selection.rows)
+            selected = [merged[i][0] for i in selected_rows]
+
+        if selected:
+            sugg = "；".join(
+                f"{c['candidate_name']}({c.get('score')}分)→{_suggest_email_type(c.get('score'))}"
+                for c in selected
+            )
+            st.caption("🎯 自动建议：" + sugg + "（可在下方按需覆盖）")
+
+            st.divider()
+
+            # ---- 邮件类型与内容 ----
+            st.markdown("**✉️ 邮件类型与内容**")
+            type_options = ["🎯 按分数自动建议", "面试邀约", "Offer通知", "拒信", "自定义"]
+            email_type_choice = st.selectbox("邮件类型", type_options, index=0)
+            extra_info = st.text_area("补充说明（可选，会提供给 AI 个性化撰写）", height=70,
+                                      placeholder="例如：面试时间地点、公司简介、薪资范围、落款等")
+            attachments = st.file_uploader("附件（可多选，如 Offer PDF / 公司简介）",
+                                           accept_multiple_files=True, key="email_attachments")
+
+            if st.button("✨ AI 生成邮件", type="primary", disabled=not api_key):
+                with st.spinner("正在为每位候选人定制邮件（并发3）..."):
+                    for c in selected:
+                        c["email_type"] = (_suggest_email_type(c.get("score"))
+                                           if email_type_choice == "🎯 按分数自动建议" else email_type_choice)
+                    st.session_state.email_drafts = engine.generate_emails_batch(
+                        selected, extra_info, api_key, model_name, max_workers=3)
+                st.success(f"已为 {len(st.session_state.email_drafts)} 位候选人生成定制邮件")
+
+            # ---- 预览与编辑 ----
+            if st.session_state.email_drafts:
+                st.divider()
+                st.markdown("**📝 邮件预览与编辑**")
+                for c in selected:
+                    name = c["candidate_name"]
+                    draft = st.session_state.email_drafts.get(name)
+                    if not draft:
+                        continue
+                    with st.expander(f"📧 {name}（{draft.get('email_type', '')}）"):
+                        draft["email"] = st.text_input(
+                            "收件邮箱", value=draft.get("email") or _candidate_email(c),
+                            key=f"to_{name}")
+                        draft["subject"] = st.text_input("主题", value=draft.get("subject", ""), key=f"subj_{name}")
+                        draft["body"] = st.text_area("正文（HTML）", value=draft.get("body", ""),
+                                                     height=160, key=f"body_{name}")
+
+                st.divider()
+                sb1, sb2 = st.columns(2)
+                with sb1:
+                    send_clicked = st.button("📤 一键发送", type="primary")
+                with sb2:
+                    export_rows = [{"候选人": n, "邮箱": d.get("email", ""),
+                                    "主题": d.get("subject", ""), "正文": d.get("body", "")}
+                                   for n, d in st.session_state.email_drafts.items()]
+                    st.download_button("📥 导出邮件清单 CSV",
+                                       data=pd.DataFrame(export_rows).to_csv(index=False).encode("utf-8-sig"),
+                                       file_name="email_batch.csv", mime="text/csv")
+
+                if send_clicked:
+                    if not (sender_email and auth_code and smtp_server):
+                        st.error("请先填写完整的发件人配置（发件邮箱、授权码、SMTP 服务器）")
+                    else:
+                        missing = [n for n, d in st.session_state.email_drafts.items() if not d.get("email")]
+                        if missing:
+                            st.error("以下候选人缺少收件邮箱：" + "、".join(missing))
+                        else:
+                            sent_count, fail_records = 0, []
+                            for n, d in st.session_state.email_drafts.items():
+                                try:
+                                    _send_one_email(sender_email, auth_code, smtp_server,
+                                                    d["email"], d["subject"], d["body"], attachments)
+                                    db.save_email_log(candidate_name=n, recipient_email=d["email"],
+                                                      email_type=d.get("email_type"), subject=d["subject"],
+                                                      body=d["body"], status="sent")
+                                    sent_count += 1
+                                except Exception as e:
+                                    fail_records.append({"候选人": n, "邮箱": d.get("email", ""), "原因": str(e)})
+                                    db.save_email_log(candidate_name=n, recipient_email=d.get("email"),
+                                                      email_type=d.get("email_type"), subject=d["subject"],
+                                                      body=d["body"], status=f"fail:{e}")
+                            st.session_state.send_failures = fail_records
+                            if sent_count:
+                                st.success(f"✅ 已成功发送 {sent_count} 封邮件")
+                            if fail_records:
+                                st.error(f"⚠️ 有 {len(fail_records)} 封邮件发送失败，可用下方「导出失败名单」下载重试名单")
+                            st.session_state.email_drafts = {}
+
+    # ---- 发送失败名单导出 ----
+    if st.session_state.get("send_failures"):
+        st.download_button(
+            "📥 导出失败名单 CSV",
+            data=pd.DataFrame(st.session_state.send_failures).to_csv(index=False).encode("utf-8-sig"),
+            file_name="send_failures.csv", mime="text/csv")
+
+    # ---- 最近发送记录 ----
+    st.divider()
+    st.markdown("**🕓 最近发送记录**")
+    email_rows = db.list_email_log(limit=50)
+    if not email_rows:
+        st.caption("暂无发送记录。")
+    else:
+        elog_df = pd.DataFrame(email_rows)
+        elog_df["created_at"] = elog_df["created_at"].apply(
+            lambda t: datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M"))
+        elog_df = elog_df.rename(columns={
+            "created_at": "发送时间", "candidate_name": "候选人",
+            "recipient_email": "邮箱", "email_type": "邮件类型", "status": "状态"
+        })
+        st.dataframe(elog_df, use_container_width=True)
